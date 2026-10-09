@@ -1,0 +1,21 @@
+# Local settings
+/config.json
+/config.tmp
+.env
+.env.*
+!.env.example
+# Runtime and dependencies
+/sys/.deps/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+/sys/status.json
+/sys/status.tmp
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,23 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Python syntax
+        run: python -m compileall -q sys tests
+      - name: Test presence formatting and pause timer
+        run: python -m unittest discover -s tests -v
+      - name: Check PowerShell syntax
+        shell: powershell
+        run: |
+          Get-ChildItem sys -Filter *.ps1 | ForEach-Object {
+            $parseTokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$parseTokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }

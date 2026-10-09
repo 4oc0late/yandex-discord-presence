@@ -1,0 +1,19 @@
+{
+  "discord_application_id": "",
+  "source_keywords": ["Яндекс Музыка", "Yandex Music", "YandexMusic", "music.yandex", "pulsesync"],
+  "process_names": ["Яндекс Музыка.exe"],
+  "fallback_image_asset": "yandex_music",
+  "find_cover_online": true,
+  "clear_when_paused": false,
+  "hide_after_pause": true,
+  "pause_timeout_seconds": 300,
+  "poll_seconds": 2,
+  "details_template": "{title}",
+  "state_template": "{artist}",
+  "show_cover": true,
+  "show_timing": true,
+  "show_button": true,
+  "link_title": true,
+  "button_label": "Открыть трек",
+  "activity_type": "LISTENING"
+}
