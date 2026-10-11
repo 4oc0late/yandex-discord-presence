@@ -11,12 +11,15 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("yandex_presence")
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 sys.path.insert(0, str(Path(__file__).with_name(".deps")))
+_api_retry_at = 0.0
+_web_retry_at = 0.0
 
 
 @dataclass(frozen=True)
@@ -118,27 +121,21 @@ def _normalized(text: str) -> str:
     return re.sub(r"[^\w]+", "", text.casefold())
 
 
-def find_cover(track: Track) -> tuple[str | None, str | None]:
-    """Best-effort public search; never substitute an unrelated cover."""
-    query = urlencode({"text": f"{track.artist} {track.title}", "type": "track", "page": 0})
-    request = Request(
-        f"https://api.music.yandex.net/search?{query}",
-        headers={"User-Agent": "YandexDiscordPresence/1.0"},
-    )
-    try:
-        with urlopen(request, timeout=5) as response:
-            data = json.load(response)
-        results = data.get("result", {}).get("tracks", {}).get("results", [])
-        for item in results[:10]:
+def cover_from_items(track: Track, results: list[dict]) -> tuple[str | None, str | None]:
+    for item in results[:30]:
+        try:
             title = str(item.get("title", ""))
             artists = [str(a.get("name", "")) for a in item.get("artists", [])]
             if _normalized(title) != _normalized(track.title):
                 continue
-            if track.artist and not any(_normalized(a) in _normalized(track.artist) or _normalized(track.artist) in _normalized(a) for a in artists if a):
+            artist_names = {_normalized(track.artist)} | {
+                _normalized(part) for part in re.split(r",|;|\s+(?:&|feat\.?|ft\.?)\s+", track.artist, flags=re.I)
+            }
+            if track.artist and not any(_normalized(a) in artist_names for a in artists if a):
                 continue
             albums = item.get("albums") or []
             track_id = str(item.get("id", ""))
-            album_id = str(albums[0].get("id", "")) if albums else ""
+            album_id = str(item.get("albumId") or (albums[0].get("id", "") if albums else ""))
             link = f"https://music.yandex.ru/album/{album_id}/track/{track_id}" if album_id and track_id else None
             cover = item.get("coverUri") or (albums[0].get("coverUri") if albums else None)
             image_url = (
@@ -147,9 +144,117 @@ def find_cover(track: Track) -> tuple[str | None, str | None]:
             )
             if image_url or link:
                 return image_url, link
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        LOG.debug("Cover search unavailable: %s", exc)
+        except (AttributeError, TypeError, ValueError):
+            continue
     return None, None
+
+
+def web_search_items(html: str) -> list[dict]:
+    """Read public search state as JSON only; never execute page scripts."""
+    decoder = json.JSONDecoder()
+    items = []
+
+    def collect(value):
+        if isinstance(value, dict):
+            if value.get("type") == "track" and isinstance(value.get("data"), dict):
+                items.append(value["data"])
+            else:
+                for child in value.values():
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for match in re.finditer(r"window\.__STATE_PATCHES__[^;]*?\.push\(", html):
+        try:
+            patches, _ = decoder.raw_decode(html[match.end():].lstrip())
+            collect(patches)
+        except (ValueError, RecursionError):
+            continue
+    return items
+
+
+def retry_delay(error: HTTPError) -> float:
+    try:
+        return max(60, min(3600, float(error.headers.get("Retry-After", 300))))
+    except (AttributeError, TypeError, ValueError):
+        return 300
+
+
+def find_cover(track: Track) -> tuple[str | None, str | None]:
+    """Try the API, then the public website, with independent cooldowns."""
+    global _api_retry_at, _web_retry_at
+    if track.title == "Яндекс Музыка открыта" and track.artist == "Ожидание трека":
+        return None, None
+    fallback = (None, None)
+    text = f"{track.artist} {track.title}"
+    if time.monotonic() >= _api_retry_at:
+        query = urlencode({"text": text, "type": "track", "page": 0})
+        request = Request(f"https://api.music.yandex.net/search?{query}",
+                          headers={"User-Agent": "YandexDiscordPresence/1.0"})
+        try:
+            with urlopen(request, timeout=5) as response:
+                data = json.load(response)
+            result = cover_from_items(track, data.get("result", {}).get("tracks", {}).get("results", []))
+            if result[0]:
+                return result
+            fallback = result
+        except HTTPError as exc:
+            delay = retry_delay(exc) if exc.code == 429 else 60
+            _api_retry_at = time.monotonic() + delay
+            LOG.warning("Yandex API returned HTTP %s; retry in %.0fs, trying public search", exc.code, delay)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            _api_retry_at = time.monotonic() + 60
+            LOG.warning("Yandex API search unavailable; trying public search: %s", exc)
+    if time.monotonic() >= _web_retry_at:
+        request = Request("https://music.yandex.ru/search?" + urlencode({"text": text}),
+                          headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"})
+        try:
+            with urlopen(request, timeout=5) as response:
+                html = response.read(4_000_000).decode("utf-8")
+            result = cover_from_items(track, web_search_items(html))
+            if result[0] or result[1]:
+                LOG.info("Artwork found via public Yandex Music search")
+                return result
+        except HTTPError as exc:
+            delay = retry_delay(exc) if exc.code == 429 else 60
+            _web_retry_at = time.monotonic() + delay
+            LOG.warning("Public search returned HTTP %s; retry in %.0fs", exc.code, delay)
+        except (OSError, ValueError, TypeError) as exc:
+            _web_retry_at = time.monotonic() + 60
+            LOG.warning("Public artwork search unavailable: %s", exc)
+    return fallback
+
+
+class CoverCache:
+    def __init__(self, finder=None):
+        self.finder = finder or find_cover
+        self.entries = {}
+
+    def lookup(self, track: Track, now: float) -> tuple[str | None, str | None]:
+        entry = self.entries.get(track.key)
+        if entry is not None and now < entry[1]:
+            return entry[0]
+        result = self.finder(track)
+        # Transient failures must not be cached for the whole process lifetime.
+        self.entries[track.key] = (result, now + (86400 if result[0] else 60))
+        if len(self.entries) > 256:
+            del self.entries[next(iter(self.entries))]
+        return result
+
+
+def disconnect_rpc(rpc: object) -> None:
+    """Close this connection without closing the application's running loop."""
+    try:
+        rpc.send_data(2, {"v": 1, "client_id": rpc.client_id})
+    except Exception:
+        pass
+    writer = getattr(rpc, "sock_writer", None)
+    if writer is not None:
+        try:
+            writer.close()
+        except Exception as exc:
+            LOG.debug("RPC transport close failed: %s", exc)
 
 
 async def read_track(manager: object, keywords: list[str]) -> Track | None:
@@ -212,7 +317,8 @@ async def run() -> None:
     rpc = None
     last_track: Track | None = None
     last_sent_at = 0.0
-    cover_cache: dict[tuple[str, str, str], tuple[str | None, str | None]] = {}
+    cover_cache = CoverCache()
+    last_artwork = None
     next_connect = 0.0
     poll = max(1, float(config.get("poll_seconds", 2)))
     keywords = config.get("source_keywords") or ["Яндекс Музыка", "Yandex Music", "YandexMusic", "music.yandex"]
@@ -238,9 +344,10 @@ async def run() -> None:
                     try:
                         await rpc.clear()
                     finally:
-                        rpc.close()
+                        disconnect_rpc(rpc)
                         rpc = None
                         last_track = None
+                        last_artwork = None
                     LOG.info("Pause timeout reached; presence cleared and RPC disconnected")
                 if active and rpc is None and time.monotonic() >= next_connect:
                     try:
@@ -248,40 +355,46 @@ async def run() -> None:
                         await rpc.connect()
                         LOG.info("Connected to Discord")
                     except Exception as exc:
+                        if rpc is not None:
+                            disconnect_rpc(rpc)
                         rpc = None
                         next_connect = time.monotonic() + 10
                         LOG.warning("Discord unavailable; retrying in 10 seconds: %s", exc)
                 if rpc is not None:
+                    cover, link = (None, None)
+                    if active and config.get("find_cover_online", True):
+                        cover, link = await asyncio.to_thread(cover_cache.lookup, track, time.monotonic())
+                    image = cover or config.get("fallback_image_asset") or None
                     if not active:
                         if last_track is not None:
                             await rpc.clear()
                             last_track = None
+                            last_artwork = None
                             LOG.info("Presence cleared")
                     elif (last_track is None or track.key != last_track.key or track.playing != last_track.playing
+                          or (image, link) != last_artwork
                           or (track.playing and abs(track.position - (last_track.position + time.monotonic() - last_sent_at)) > 4)
                           or time.monotonic() - last_sent_at > 60):
                         assert track is not None
-                        if track.key not in cover_cache:
-                            cover_cache[track.key] = await asyncio.to_thread(find_cover, track) if config.get("find_cover_online", True) else (None, None)
-                        cover, link = cover_cache[track.key]
-                        image = cover or config.get("fallback_image_asset") or None
                         activity_type = getattr(ActivityType, config.get("activity_type", "LISTENING"), ActivityType.LISTENING)
                         payload = build_payload(track, image, link, activity_type, int(time.time() * 1000), config)
                         if last_track is not None and last_track.playing and not track.playing:
                             await rpc.clear()
                         await rpc.update(**payload)
                         last_track = track
+                        last_artwork = (image, link)
                         last_sent_at = time.monotonic()
                         LOG.info("%s — %s%s", track.artist, track.title, " (paused)" if not track.playing else "")
             except Exception as exc:
                 LOG.warning("Could not update presence: %s", exc)
                 if rpc is not None:
                     try:
-                        rpc.close()
+                        disconnect_rpc(rpc)
                     except Exception:
                         pass
                     rpc = None
                 last_track = None
+                last_artwork = None
                 next_connect = time.monotonic() + 10
             try:
                 status_path = Path(__file__).with_name("status.json")
@@ -292,6 +405,7 @@ async def run() -> None:
                     "artist": track.artist if track else "", "album": track.album if track else "",
                     "playing": track.playing if track else False,
                     "pause_timed_out": bool(pause_timed_out),
+                    "presence_image": last_artwork[0] if last_artwork else None,
                     "position": track.position if track else 0, "duration": track.duration if track else 0,
                 }, ensure_ascii=False), encoding="utf-8")
                 status_tmp.replace(status_path)
@@ -302,9 +416,10 @@ async def run() -> None:
         if rpc is not None:
             try:
                 await rpc.clear()
-                rpc.close()
             except Exception:
                 pass
+            finally:
+                disconnect_rpc(rpc)
 
 
 if __name__ == "__main__":
